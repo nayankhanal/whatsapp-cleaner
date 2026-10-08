@@ -37,7 +37,6 @@
   }
 
   function realClick(el) {
-    el.scrollIntoView?.({ block: 'center' });
     const r = el.getBoundingClientRect();
     const o = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
     el.dispatchEvent(new PointerEvent('pointerdown', o));
@@ -162,51 +161,236 @@
     return pane;
   }
 
-  async function deleteContact(pane) {
-    const editBtn = pane.querySelector('[aria-label="Edit" i], [aria-label^="Edit" i], [data-icon*="pencil"], [data-icon*="edit"]');
-    if (!editBtn) return 'not a saved contact (no edit button)';
-    realClick(clickable(editBtn));
+  // All visible clickable icons/buttons (used by the Debug dump).
+  function allButtons() {
+    const set = new Set();
+    for (const el of document.querySelectorAll('button, [role="button"], [data-icon], svg')) {
+      if (inPanel(el) || !isVisible(el)) continue;
+      set.add(el.matches('svg, [data-icon]') ? clickable(el) : el);
+    }
+    return [...set];
+  }
 
-    const editTitle = await waitFor(() => findText([/^edit contact$/i]), 6000);
-    if (!editTitle) return 'Edit contact panel did not open';
+  // True when the element is actually the topmost thing on screen at its centre (not hidden behind a popup).
+  function onTop(el) {
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) return false;
+    const h = document.elementFromPoint(x, y);
+    if (!h || inPanel(h)) return false;
+    if (el === h || el.contains(h)) return true;
+    const hr = h.getBoundingClientRect();
+    return h.contains(el) && hr.width < 700 && hr.height < 200; // e.g. a button wrapping the text
+  }
+
+  const depth = (el) => { let d = 0; while ((el = el.parentElement)) d++; return d; };
+
+  // Deepest visible, on-top element whose text/label exactly matches. scroll=true scrolls it into view first.
+  async function findOnTop(patterns, { scroll = false, exclude = null } = {}) {
+    const cands = [];
+    for (const el of document.querySelectorAll('body *')) {
+      if (inPanel(el) || el === exclude || (exclude && exclude.contains(el))) continue;
+      const label = el.getAttribute('aria-label') || '';
+      const tc = el.textContent || '';
+      if (tc.length > 80 && !label) continue; // cheap pre-filter, avoids layout on big containers
+      const text = el.children.length > 4 || tc.length > 80 ? '' : (el.innerText || '').trim();
+      if (patterns.some((p) => p.test(text) || p.test(label)) && isVisible(el)) cands.push(el);
+    }
+    cands.sort((a, b) => depth(b) - depth(a));
+    for (const el of cands) {
+      if (scroll) {
+        const r = el.getBoundingClientRect();
+        if (r.top < 0 || r.bottom > window.innerHeight) { el.scrollIntoView({ block: 'center' }); await sleep(400); }
+      }
+      if (onTop(el)) return el;
+    }
+    return null;
+  }
+
+  async function waitOnTop(patterns, timeout = 6000, opts = {}) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (!state.running) throw new Error('Stopped by user');
+      const el = await findOnTop(patterns, opts);
+      if (el) return el;
+      await sleep(250);
+    }
+    return null;
+  }
+
+  // Scan from the right edge leftwards along a row and return the first small, icon-sized element.
+  // Works whether the icon is an <svg>, <img>, <span data-icon> or a CSS background.
+  // Used for ✏️ (Contact info), 🗑 (Edit contact) and ⋮ (chat header).
+  function iconInRow(rowEl, minX, maxX = window.innerWidth - 2) {
+    const r = rowEl.getBoundingClientRect();
+    const y = r.top + r.height / 2;
+    for (let x = maxX; x > minX; x -= 3) {
+      const h = document.elementFromPoint(x, y);
+      if (!h || inPanel(h)) continue;
+      let found = null;
+      for (let el = h, i = 0; el && el !== document.body && i < 7; el = el.parentElement, i++) {
+        if (el.contains(rowEl)) break;
+        const b = el.getBoundingClientRect();
+        if (b.width >= 12 && b.width <= 72 && b.height >= 12 && b.height <= 72) found = el; // keep the largest icon-sized ancestor
+        else if (b.width > 72 || b.height > 72) break;
+      }
+      if (found) {
+        const btn = found.closest('button, [role="button"]');
+        return btn && !btn.contains(rowEl) && btn.getBoundingClientRect().width <= 72 ? btn : found;
+      }
+    }
+    return null;
+  }
+
+  const describe = (el) =>
+    el ? `<${el.tagName.toLowerCase()}${el.getAttribute('aria-label') ? ` label="${el.getAttribute('aria-label')}"` : ''}${
+      el.querySelector?.('[data-icon]') ? ` icon="${el.querySelector('[data-icon]').getAttribute('data-icon')}"` : ''
+    }> at ${Math.round(el.getBoundingClientRect().left)},${Math.round(el.getBoundingClientRect().top)}` : 'none';
+
+  // A pane title like "Contact info" / "Edit contact": visible text only (not aria-labels), short single-line element.
+  async function findTitle(re, timeout = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (!state.running) throw new Error('Stopped by user');
+      const hits = [...document.querySelectorAll('body *')].filter((el) => {
+        if (inPanel(el) || el.children.length > 2) return false;
+        const tc = el.textContent || '';
+        if (tc.length > 30 || !re.test(tc.trim())) return false;
+        const r = el.getBoundingClientRect();
+        return r.height > 0 && r.height < 60 && onTop(el);
+      });
+      if (hits.length) return hits.sort((a, b) => depth(b) - depth(a))[0];
+      await sleep(250);
+    }
+    return null;
+  }
+
+  // Icon-sized elements on the same row as the title and to its right, rightmost first.
+  function iconsRightOf(titleEl) {
+    const t = titleEl.getBoundingClientRect();
+    const cy = t.top + t.height / 2;
+    const out = [];
+    for (const el of document.querySelectorAll('body *')) {
+      if (inPanel(el) || el.contains(titleEl)) continue;
+      const b = el.getBoundingClientRect();
+      if (b.width < 12 || b.width > 72 || b.height < 12 || b.height > 72) continue;
+      if (b.left < t.right || Math.abs(b.top + b.height / 2 - cy) > 25) continue;
+      out.push(el);
+    }
+    // Collapse nested matches to the outermost icon-sized element, prefer real buttons.
+    const outer = out.filter((el) => !out.some((o) => o !== el && o.contains(el)));
+    return outer
+      .map((el) => el.closest('button, [role="button"]') && el.closest('button, [role="button"]').getBoundingClientRect().width <= 72 ? el.closest('button, [role="button"]') : el)
+      .sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+  }
+
+  // Click icons right of `title` (rightmost first) until `nextTitle` appears.
+  async function clickIconUntil(title, nextRe, name) {
+    const icons = iconsRightOf(title);
+    log(`  ${name}: ${icons.length} icon(s) right of "${title.textContent.trim()}"`);
+    for (const ic of icons.slice(0, 3)) {
+      log(`  ${name} clicking ${describe(ic)}`);
+      realClick(ic);
+      const next = await findTitle(nextRe, 3000);
+      if (next) return next;
+    }
+    return null;
+  }
+
+  // WhatsApp's own test ids (from the page's HTML).
+  const SEL = {
+    infoDrawer: '[data-testid="chat-info-drawer"]',
+    editBtn: 'header button[aria-label="Edit"], header [data-icon^="pencil"]',
+    editDrawer: '[data-testid="save-contact-drawer"]',
+    deleteContactBtn: '[data-testid="btn-delete-contact"], [aria-label="Delete contact"]',
+    deleteChatItem: '[data-testid="li-delete-chat"]',
+  };
+
+  async function deleteContact() {
+    const drawer = await waitFor(() => document.querySelector(SEL.infoDrawer), 5000);
+    if (!drawer) return 'Contact info panel not open';
+    await sleep(400);
+    const edit = drawer.querySelector(SEL.editBtn);
+    if (!edit) return 'not a saved contact (no ✏️ Edit button)';
+    const editBtn = edit.closest('button, [role="button"]') || edit;
+    log(`  ✏️ clicking ${describe(editBtn)}`);
+    realClick(editBtn);
+
+    const editDrawer = await waitFor(() => document.querySelector(SEL.editDrawer), 6000);
+    if (!editDrawer) return 'Edit contact panel did not open after clicking ✏️';
+    const del = await waitFor(() => editDrawer.querySelector(SEL.deleteContactBtn), 4000);
+    if (!del) return '🗑 Delete contact button not found';
     await sleep(500);
-    const editPane = paneFrom(editTitle);
+    log(`  🗑 clicking ${describe(del)}`);
+    realClick(del);
 
-    const del = editPane.querySelector('[aria-label*="delete" i], [title*="delete" i], [data-icon*="delete"], [data-icon*="trash"]');
-    if (!del) { pressEscape(); return 'delete button not found in Edit contact'; }
-    realClick(clickable(del));
-
-    const confirmMsg = /^this contact will be deleted/i;
-    const confirmTitle = await waitFor(() => findText([confirmMsg], dialogRoot()), 6000);
-    if (!confirmTitle) return 'Delete contact confirmation did not appear';
-    const btn = await waitFor(() => findText([/^delete$/i], dialogRoot()), 4000);
-    if (!btn) return 'Delete button in confirmation not found';
-    realClick(clickable(btn));
-    await waitFor(() => !findText([confirmMsg]), 6000);
+    const msg = await waitOnTop([/^this contact will be deleted/i], 6000);
+    if (!msg) return 'Delete contact popup did not appear after clicking 🗑';
+    await sleep(300);
+    const btn = await waitOnTop([/^delete$/i], 4000);
+    log(`  popup clicking ${describe(btn)}`);
+    if (!btn) return '"Delete" button in popup not found';
+    realClick(btn);
+    await waitFor(() => !/This contact will be deleted/i.test(document.body.innerText), 6000);
+    await sleep(1000);
     return 'ok';
   }
 
-  async function deleteChat() {
-    const header = await waitFor(() => document.querySelector('#main header'), 5000);
-    if (!header) return 'chat is not open';
-    const menu = header.querySelector('[aria-label="Menu" i], [title="Menu" i], [data-icon="menu"], [data-icon*="more"]');
-    if (!menu) return 'chat menu (⋮) not found';
-    realClick(clickable(menu));
+  async function ensureContactInfoOpen() {
+    if (document.querySelector(SEL.infoDrawer) || (await findOnTop([/^contact info$/i]))) return true;
+    const header = document.querySelector('#main header');
+    if (!header) return false;
+    realClick(header.querySelector('span[dir="auto"]') || header);
+    return !!(await waitFor(() => document.querySelector(SEL.infoDrawer), 5000));
+  }
 
-    const item = await waitFor(() => findText([/^delete chat$/i]) || findText([/^clear chat$/i]), 4000);
-    if (!item) { pressEscape(); return '"Delete chat" not in menu'; }
-    const isClear = /clear/i.test(item.innerText || item.getAttribute('aria-label') || '');
-    realClick(clickable(item));
-    await sleep(700);
-
-    const confirm = await waitFor(
-      () => findText(isClear ? [/^clear chat$/i, /^clear$/i] : [/^delete chat$/i, /^delete$/i], dialogRoot()),
-      5000
-    );
-    if (!confirm) { pressEscape(); return 'confirmation button not found'; }
-    realClick(clickable(confirm));
+  async function confirmPopup(itemEl, patterns) {
+    // The menu/drawer item we clicked has the same text, so exclude it.
+    await sleep(900);
+    const btn = await waitOnTop(patterns, 5000, { exclude: itemEl });
+    if (!btn) { pressEscape(); return false; }
+    realClick(btn);
     await sleep(1500);
+    return true;
+  }
+
+  async function deleteChat() {
+    if (!document.querySelector('#main header')) return 'chat is not open';
+
+    // 1) "Delete chat" at the bottom of the Contact info panel.
+    if (await ensureContactInfoOpen()) {
+      const item = document.querySelector(SEL.deleteChatItem) || (await findOnTop([/^delete chat$/i], { scroll: true }));
+      if (item) {
+        realClick(item);
+        return (await confirmPopup(item, [/^delete chat$/i, /^delete$/i])) ? 'ok' : 'Delete chat popup button not found';
+      }
+    }
+
+    // 2) Fallback: ⋮ menu in the chat header.
+    const header = document.querySelector('#main header');
+    const hb = header.getBoundingClientRect();
+    const menu = iconInRow(header, hb.left + hb.width / 2, hb.right - 2);
+    if (!menu) return 'chat menu (⋮) not found';
+    realClick(menu);
+    let item = await waitOnTop([/^delete chat$/i], 3000);
+    let isClear = false;
+    if (!item) { item = await findOnTop([/^clear chat$/i]); isClear = !!item; }
+    if (!item) { pressEscape(); return '"Delete chat" not in menu'; }
+    realClick(item);
+    const ok = await confirmPopup(item, isClear ? [/^clear chat$/i, /^clear$/i] : [/^delete chat$/i, /^delete$/i]);
+    if (!ok) return 'popup confirm button not found';
     return isClear ? 'ok (cleared — Delete chat was not offered)' : 'ok';
+  }
+
+  // Copies a description of the visible buttons, to diagnose when WhatsApp changes its layout.
+  function debugDump() {
+    const rows = allButtons().map((b) => {
+      const r = b.getBoundingClientRect();
+      const icon = b.querySelector('[data-icon]')?.getAttribute('data-icon') || b.getAttribute('data-icon') || '';
+      return `${Math.round(r.left)},${Math.round(r.top)}\t${b.tagName.toLowerCase()}\tlabel="${b.getAttribute('aria-label') || ''}"\ticon="${icon}"\ttext="${(b.innerText || '').trim().slice(0, 30)}"`;
+    });
+    return rows.join('\n');
   }
 
   // ---------- runner ----------
@@ -234,7 +418,7 @@
           log('  ✗ skipped, could not open this chat');
         } else {
           if (state.opts.deleteContact) {
-            res.contact = await deleteContact(pane);
+            res.contact = await deleteContact();
             log(`  contact: ${res.contact}`);
             await sleep(800);
           }
@@ -289,9 +473,10 @@
       <label><input type="checkbox" class="wc-contact" checked> Delete saved contact</label>
       <label><input type="checkbox" class="wc-chat" checked> Delete chat</label>
       <label><input type="checkbox" class="wc-url" checked> If search fails, open via link (reloads page)</label>
+      <label>Default country code (added to 10-digit numbers) <input type="number" class="wc-cc" value="1" min="1"></label>
       <label>Delay between numbers (ms) <input type="number" class="wc-delay" value="1500" min="500" step="250"></label>
       <div class="wc-status"></div>
-      <button class="wc-start">Start</button><button class="wc-stop">Stop</button><button class="wc-sec wc-export">Copy report</button>
+      <button class="wc-start">Start</button><button class="wc-stop">Stop</button><button class="wc-sec wc-export">Copy report</button><button class="wc-sec wc-debug">Debug</button>
       <div class="wc-log"></div>
     </div>`;
   document.body.appendChild(panel);
@@ -321,7 +506,9 @@
   });
 
   $('.wc-start').addEventListener('click', () => {
-    const nums = [...new Set($('.wc-nums').value.split(/[\n,;]+/).map(digits).filter((n) => n.length >= 7))];
+    const cc = digits($('.wc-cc').value);
+    const nums = [...new Set($('.wc-nums').value.split(/[\n,;]+/).map(digits).filter((n) => n.length >= 7)
+      .map((n) => (n.length === 10 && cc ? cc + n : n)))];
     if (!nums.length) return alert('Add at least one phone number (with country code).');
     const opts = {
       deleteContact: $('.wc-contact').checked,
@@ -349,6 +536,11 @@
     const lines = ['number\tcontact\tchat', ...(state.results || []).map((r) => `${r.num}\t${r.contact}\t${r.chat}`)];
     await navigator.clipboard.writeText(lines.join('\n'));
     log('📋 Report copied to clipboard (tab-separated, paste into Sheets/Excel).');
+  });
+
+  $('.wc-debug').addEventListener('click', async () => {
+    await navigator.clipboard.writeText(debugDump());
+    log('🐞 Button list copied to clipboard. Paste it to Claude.');
   });
 
   // Resume after a reload triggered by the link fallback.
