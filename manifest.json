@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsApp Chat & Contact Cleaner",
+  "version": "1.0.0",
+  "description": "Deletes the chat and the saved contact for a list of phone numbers on WhatsApp Web by automating the UI clicks.",
+  "content_scripts": [
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
